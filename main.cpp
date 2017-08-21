@@ -6,7 +6,7 @@
 
 #include <windows.h>
 
-HHOOK KeyboardHook;
+HHOOK Hook;
 bool ShouldJump = false;
 unsigned KeyCode;
 
@@ -30,10 +30,63 @@ bool IsDishonored2InFocus(){
     return true;
 }
 
+LRESULT CALLBACK LowLevelMouseProc(int Code,WPARAM WParam,LPARAM LParam){
+    assert(Code == HC_ACTION);
+
+    unsigned ButtonCode = 0;
+    bool IsDown = false;
+    switch(WParam){
+        case WM_LBUTTONDOWN: {
+            IsDown = true;
+            //[[fallthrough]];
+        }
+        case WM_LBUTTONUP: {
+            ButtonCode = VK_LBUTTON;
+            break;
+        }
+        case WM_RBUTTONDOWN: {
+            IsDown = true;
+            //[[fallthrough]];
+        }
+        case WM_RBUTTONUP: {
+            ButtonCode = VK_RBUTTON;
+            break;
+        }
+        case WM_MBUTTONDOWN: {
+            IsDown = true;
+            //[[fallthrough]];
+        }
+        case WM_MBUTTONUP: {
+            ButtonCode = VK_MBUTTON;
+            break;
+        }
+        case WM_XBUTTONDOWN: {
+            IsDown = true;
+            //[[fallthrough]];
+        }
+        case WM_XBUTTONUP: {
+            auto& Info = *reinterpret_cast<MSLLHOOKSTRUCT*>(LParam);
+
+            ButtonCode = VK_XBUTTON1+HIWORD(Info.mouseData)-XBUTTON1;
+            break;
+        }
+    }
+
+    if(ButtonCode == KeyCode){
+        ShouldJump = IsDown;
+
+        if(IsDishonored2InFocus()){
+            return 1;//stop propagation
+        }
+    }
+
+    return CallNextHookEx(Hook,Code,WParam,LParam);
+}
+
 LRESULT CALLBACK LowLevelKeyboardProc(int Code,WPARAM WParam,LPARAM LParam){
     assert(Code == HC_ACTION);
 
-    KBDLLHOOKSTRUCT& Info = *reinterpret_cast<KBDLLHOOKSTRUCT*>(LParam);
+    auto& Info = *reinterpret_cast<KBDLLHOOKSTRUCT*>(LParam);
 
     if(Info.vkCode == KeyCode){
         ShouldJump = (WParam == WM_KEYDOWN || WParam == WM_SYSKEYDOWN);
@@ -43,7 +96,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int Code,WPARAM WParam,LPARAM LParam){
         }
     }
 
-    return CallNextHookEx(KeyboardHook,Code,WParam,LParam);
+    return CallNextHookEx(Hook,Code,WParam,LParam);
 }
 
 void SendJump(){
@@ -61,7 +114,7 @@ int main(){
         return 0;
     }
 
-    if(std::fscanf(File,"%u",&KeyCode) != 1){
+    if(std::fscanf(File,"0x%x",&KeyCode) != 1 && std::fscanf(File,"%u",&KeyCode) != 1){
         std::fprintf(stderr,"Unable to read key code from \"%s\".\n",ConfigFilename);
         std::getchar();
         return 0;
@@ -69,9 +122,14 @@ int main(){
 
     std::fclose(File);
 
-    KeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL,LowLevelKeyboardProc,nullptr,0);
-    if(!KeyboardHook){
-        std::fprintf(stderr,"Unable to install keyboard hook.\nError code: 0x%08lX\n",GetLastError());
+    if((KeyCode >= VK_LBUTTON && KeyCode <= VK_RBUTTON) || (KeyCode >= VK_MBUTTON && KeyCode <= VK_XBUTTON2)){
+        Hook = SetWindowsHookExW(WH_MOUSE_LL,LowLevelMouseProc,nullptr,0);
+    }else{
+        Hook = SetWindowsHookExW(WH_KEYBOARD_LL,LowLevelKeyboardProc,nullptr,0);
+    }
+
+    if(!Hook){
+        std::fprintf(stderr,"Unable to keyboard hook.\nError code: 0x%08lX\n",GetLastError());
         std::getchar();
         return 0;
     }
