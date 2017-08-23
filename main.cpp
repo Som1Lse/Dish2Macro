@@ -1,5 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
+#include <atomic>
+
 #include <cassert>
 #include <cstdio>
 #include <cwchar>
@@ -7,10 +9,10 @@
 #include <windows.h>
 
 HHOOK Hook;
-bool ShouldJump = false;
+std::atomic<bool> ShouldJump = false;
 unsigned KeyCode;
 
-bool IsDishonored2InFocus(){
+bool IsGameInFocus(){
     auto Window = GetForegroundWindow();
 
     wchar_t ClassName[14];
@@ -72,12 +74,10 @@ LRESULT CALLBACK LowLevelMouseProc(int Code,WPARAM WParam,LPARAM LParam){
         }
     }
 
-    if(ButtonCode == KeyCode){
+    if(ButtonCode == KeyCode && IsGameInFocus()){
         ShouldJump = IsDown;
 
-        if(IsDishonored2InFocus()){
-            return 1;//stop propagation
-        }
+        return 1;//stop propagation
     }
 
     return CallNextHookEx(Hook,Code,WParam,LParam);
@@ -88,20 +88,24 @@ LRESULT CALLBACK LowLevelKeyboardProc(int Code,WPARAM WParam,LPARAM LParam){
 
     auto& Info = *reinterpret_cast<KBDLLHOOKSTRUCT*>(LParam);
 
-    if(Info.vkCode == KeyCode){
+    if(Info.vkCode == KeyCode && IsGameInFocus()){
         ShouldJump = (WParam == WM_KEYDOWN || WParam == WM_SYSKEYDOWN);
 
-        if(IsDishonored2InFocus()){
-            return 1;//stop propagation
-        }
+        return 1;//stop propagation
     }
 
     return CallNextHookEx(Hook,Code,WParam,LParam);
 }
 
 void SendJump(){
-    if(IsDishonored2InFocus()){
-        mouse_event(MOUSEEVENTF_WHEEL,0,0,-WHEEL_DELTA,0);
+    mouse_event(MOUSEEVENTF_WHEEL,0,0,-WHEEL_DELTA,0);
+}
+
+void CALLBACK TimerProc(void*,BOOLEAN){
+    if(!IsGameInFocus()){
+        ShouldJump = false;
+    }else if(ShouldJump){
+        SendJump();
     }
 }
 
@@ -122,33 +126,33 @@ int main(){
 
     std::fclose(File);
 
-    if((KeyCode >= VK_LBUTTON && KeyCode <= VK_RBUTTON) || (KeyCode >= VK_MBUTTON && KeyCode <= VK_XBUTTON2)){
+    auto IsMouseButton = (KeyCode >= VK_LBUTTON && KeyCode <= VK_RBUTTON) ||
+                         (KeyCode >= VK_MBUTTON && KeyCode <= VK_XBUTTON2);
+
+    if(IsMouseButton){
         Hook = SetWindowsHookExW(WH_MOUSE_LL,LowLevelMouseProc,nullptr,0);
     }else{
         Hook = SetWindowsHookExW(WH_KEYBOARD_LL,LowLevelKeyboardProc,nullptr,0);
     }
 
     if(!Hook){
-        std::fprintf(stderr,"Unable to keyboard hook.\nError code: 0x%08lX\n",GetLastError());
+        std::fprintf(stderr,"Unable to set hook.\nError code: 0x%08lX\n",GetLastError());
+        std::getchar();
+        return 0;
+    }
+
+    HANDLE Timer;
+    if(!CreateTimerQueueTimer(&Timer,nullptr,TimerProc,nullptr,0,5,WT_EXECUTEDEFAULT)){
+        std::fprintf(stderr,"Unable to create timer.\nError code: 0x%08lX\n",GetLastError());
         std::getchar();
         return 0;
     }
 
     for(;;){
-        Sleep(5);
-
         MSG Message;
-        while(PeekMessage(&Message,0,0,0,PM_REMOVE)){
+        while(GetMessageW(&Message,0,0,0)){
             TranslateMessage(&Message);
-            DispatchMessage(&Message);
-        }
-
-        if(!IsDishonored2InFocus()){
-            ShouldJump = false;
-        }
-
-        if(ShouldJump){
-            SendJump();
+            DispatchMessageW(&Message);
         }
     }
 
