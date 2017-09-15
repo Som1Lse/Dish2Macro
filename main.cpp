@@ -15,8 +15,10 @@ unsigned KeyCode;
 bool IsGameInFocus(){
     auto Window = GetForegroundWindow();
 
-    wchar_t ClassName[14];
-    if(GetClassNameW(Window,ClassName,14) != 12 || std::wcscmp(ClassName,L"Dishonored 2") != 0){
+    wchar_t ClassName[35];
+    auto Size = GetClassNameW(Window,ClassName,35);
+    if((Size != 12 || std::wcscmp(ClassName,L"Dishonored 2") != 0) &&
+       (Size != 33 || std::wcscmp(ClassName,L"Dishonored: Death of the Outsider") != 0)){
         return false;
     }
 
