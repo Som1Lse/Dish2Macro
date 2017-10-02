@@ -9,7 +9,7 @@
 #include <windows.h>
 
 HHOOK Hook;
-std::atomic<bool> ShouldJump = false;
+std::atomic<bool> ShouldJump(false);
 unsigned KeyCode;
 
 bool IsGameInFocus(){
