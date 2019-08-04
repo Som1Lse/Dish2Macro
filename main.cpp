@@ -1,24 +1,29 @@
 #include <atomic>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
 
-#include <cassert>
 #include <cstdio>
 #include <cwchar>
+#include <cassert>
 
 #include <windows.h>
 
 using namespace std::literals;
 
+namespace {
+
 // Global variables are necessary, because Windows hooks have a terrible API.
-HHOOK Hook;
-std::atomic<bool> ShouldJump(false);
+HHOOK MouseHook;
+HHOOK KeyboardHook;
 
-DWORD KeyCode = VK_SPACE;
+constexpr unsigned SpamDownBit = 0x1;
+constexpr unsigned SpamUpBit   = 0x2;
+std::atomic<unsigned> SpamFlags(0);
 
-DWORD WheelDelta = -WHEEL_DELTA;
-DWORD WheelEvent = MOUSEEVENTF_WHEEL;
+DWORD DownKeyCode = 0;
+DWORD UpKeyCode   = 0;
 
 bool IsGameInFocus(){
     auto Window = GetForegroundWindow();
@@ -50,14 +55,36 @@ bool IsGameInFocus(){
     return true;
 }
 
+bool HandleKey(DWORD KeyCode,bool IsDown){
+    unsigned Mask = 0;
+
+    if(KeyCode == DownKeyCode){
+        Mask = SpamDownBit;
+    }else if(KeyCode == UpKeyCode){
+        Mask = SpamUpBit;
+    }
+
+    if(Mask == 0 || !IsGameInFocus()){
+        return false;
+    }
+
+    if(IsDown){
+        SpamFlags |=  Mask;
+    }else{
+        SpamFlags &= ~Mask;
+    }
+
+    return true;
+}
+
 LRESULT CALLBACK LowLevelMouseProc(int Code,WPARAM WParam,LPARAM LParam){
     if(Code < HC_ACTION){
-        return CallNextHookEx(Hook,Code,WParam,LParam);
+        return CallNextHookEx(MouseHook,Code,WParam,LParam);
     }
 
     assert(Code == HC_ACTION);
 
-    unsigned ButtonCode = 0;
+    DWORD KeyCode = 0;
     bool IsDown = false;
     switch(WParam){
         case WM_LBUTTONDOWN: {
@@ -66,7 +93,7 @@ LRESULT CALLBACK LowLevelMouseProc(int Code,WPARAM WParam,LPARAM LParam){
             [[fallthrough]];
         }
         case WM_LBUTTONUP: {
-            ButtonCode = VK_LBUTTON;
+            KeyCode = VK_LBUTTON;
             break;
         }
         case WM_RBUTTONDOWN: {
@@ -75,7 +102,7 @@ LRESULT CALLBACK LowLevelMouseProc(int Code,WPARAM WParam,LPARAM LParam){
             [[fallthrough]];
         }
         case WM_RBUTTONUP: {
-            ButtonCode = VK_RBUTTON;
+            KeyCode = VK_RBUTTON;
             break;
         }
         case WM_MBUTTONDOWN: {
@@ -84,7 +111,7 @@ LRESULT CALLBACK LowLevelMouseProc(int Code,WPARAM WParam,LPARAM LParam){
             [[fallthrough]];
         }
         case WM_MBUTTONUP: {
-            ButtonCode = VK_MBUTTON;
+            KeyCode = VK_MBUTTON;
             break;
         }
         case WM_XBUTTONDOWN: {
@@ -94,24 +121,22 @@ LRESULT CALLBACK LowLevelMouseProc(int Code,WPARAM WParam,LPARAM LParam){
         }
         case WM_XBUTTONUP: {
             auto& Info = *reinterpret_cast<MSLLHOOKSTRUCT*>(LParam);
+            KeyCode = VK_XBUTTON1+HIWORD(Info.mouseData)-XBUTTON1;
 
-            ButtonCode = VK_XBUTTON1+HIWORD(Info.mouseData)-XBUTTON1;
             break;
         }
     }
 
-    if(ButtonCode == KeyCode && IsGameInFocus()){
-        ShouldJump = IsDown;
-
-        return 1;// Stop propagation.
+    if(HandleKey(KeyCode,IsDown)){
+        return 1;
     }
 
-    return CallNextHookEx(Hook,Code,WParam,LParam);
+    return CallNextHookEx(MouseHook,Code,WParam,LParam);
 }
 
 LRESULT CALLBACK LowLevelKeyboardProc(int Code,WPARAM WParam,LPARAM LParam){
     if(Code < HC_ACTION){
-        return CallNextHookEx(Hook,Code,WParam,LParam);
+        return CallNextHookEx(KeyboardHook,Code,WParam,LParam);
     }
 
     assert(Code == HC_ACTION);
@@ -120,31 +145,37 @@ LRESULT CALLBACK LowLevelKeyboardProc(int Code,WPARAM WParam,LPARAM LParam){
 
     auto IsDown = (WParam == WM_KEYDOWN || WParam == WM_SYSKEYDOWN);
 
-    if(Info.vkCode == KeyCode && IsGameInFocus()){
-        ShouldJump = IsDown;
-
-        return 1;// Stop propagation.
+    if(HandleKey(Info.vkCode,IsDown)){
+        return 1;
     }
 
-    return CallNextHookEx(Hook,Code,WParam,LParam);
+    return CallNextHookEx(KeyboardHook,Code,WParam,LParam);
 }
 
-void SendJump(){
-    mouse_event(WheelEvent,0,0,WheelDelta,0);
+DWORD GetWheelDelta(unsigned Flags){
+    DWORD r = 0;
+
+    if((Flags&SpamDownBit) != 0){
+        r -= WHEEL_DELTA;
+    }
+
+    if((Flags&SpamUpBit) != 0){
+        r += WHEEL_DELTA;
+    }
+
+    return r;
 }
 
 void CALLBACK TimerProc(void*,BOOLEAN){
-    if(!ShouldJump){
-        return;
+    if(IsGameInFocus()){
+        auto WheelDelta = GetWheelDelta(SpamFlags);
+
+        if(WheelDelta != 0){
+            mouse_event(MOUSEEVENTF_WHEEL,0,0,WheelDelta,0);
+        }
+    }else{
+        SpamFlags = 0;
     }
-
-    if(!IsGameInFocus()){
-        ShouldJump = false;
-
-        return;
-    }
-
-    SendJump();
 }
 
 struct file_deleter {
@@ -155,30 +186,72 @@ struct file_deleter {
 
 using unique_file = std::unique_ptr<std::FILE,file_deleter>;
 
+// There are a few valid possible configurations:
+// <num>: <num> is the scroll down key.
+// <num> <c>: <num> is the key for either scroll up or down depending on whether or not <c> is `u` or not.
+// <num1> <num2>: <num1> is the scroll down key. <num2> is the scroll up key.
 void ReadConfiguration(const char* Filename){
     unique_file File(std::fopen(Filename,"rb"));
     if(!File){
         throw std::runtime_error("Unable to open configuration file \""s+Filename+"\".");
     }
 
-    char WheelDir = 'd';
+    auto KeyCodesRead = std::fscanf(File.get(),"%li %li",&DownKeyCode,&UpKeyCode);
 
-    if(std::fscanf(File.get(),"0x%x %c",&KeyCode,&WheelDir) < 1 && std::fscanf(File.get(),"%u %c",&KeyCode,&WheelDir) < 1){
+    if(KeyCodesRead < 1){
         throw std::runtime_error("Unable to read key code from configuration file \""s+Filename+"\".");
     }
 
-    // `|32` convers ASCII letters to lower case.
-    // None of the Dishonored games support left or right scrolling, so there is no point to supporting them here.
-    switch(WheelDir|32){
-        case 'u': WheelDelta =  WHEEL_DELTA; break;
-        case 'd': WheelDelta = -WHEEL_DELTA; break;
-        default: throw std::runtime_error("Invalid wheel direction in configuration file"s+Filename+"\".");
+    if(KeyCodesRead < 2){
+        char WheelDirection = 'd';
+
+        if(std::fscanf(File.get()," %c",&WheelDirection) == 1){
+            // `|32` converts ASCII letters to lower case.
+            switch(WheelDirection|32){
+                case 'd': break;
+                case 'u': {
+                    UpKeyCode = DownKeyCode;
+                    DownKeyCode = 0;
+
+                    break;
+                }
+                default: {
+                    throw std::runtime_error("Invalid wheel direction '+"s+WheelDirection+"+' in configuration file \""+Filename+"\".");
+                }
+            }
+        }
     }
+
+    if(DownKeyCode > VK_OEM_CLEAR){
+        throw std::runtime_error("Invalid key code "+std::to_string(DownKeyCode)+" in configuration file \""s+Filename+"\".");
+    }
+
+    if(UpKeyCode > VK_OEM_CLEAR){
+        throw std::runtime_error("Invalid key code "+std::to_string(UpKeyCode)+" in configuration file \""s+Filename+"\".");
+    }
+
+    if(DownKeyCode == UpKeyCode){
+        if(DownKeyCode == 0){
+            throw std::runtime_error("No key was bound to either scroll direction in configuration file \""s+Filename+"\".");
+        }else{
+            throw std::runtime_error("Scroll up and scroll down both have the same binding in configuration file \""s+Filename+"\".");
+        }
+    }
+}
+
+bool IsMouseButton(DWORD KeyCode){
+    return (VK_LBUTTON <= KeyCode && KeyCode <= VK_RBUTTON) || (VK_MBUTTON <= KeyCode && KeyCode <= VK_XBUTTON2);
+}
+
+bool IsKeyboardKey(DWORD KeyCode){
+    return KeyCode != 0 && !IsMouseButton(KeyCode);
+}
+
 }
 
 int main(int argc,char** argv){
     try {
-        auto ConfigFilename = "Dish2Macro.cfg";
+        auto ConfigFilename = "Dish2Macro.txt";
 
         if(argc >= 2){
             ConfigFilename = argv[1];
@@ -186,18 +259,20 @@ int main(int argc,char** argv){
 
         ReadConfiguration(ConfigFilename);
 
-        auto IsMouseButton =
-            (KeyCode >= VK_LBUTTON && KeyCode <= VK_RBUTTON) ||
-            (KeyCode >= VK_MBUTTON && KeyCode <= VK_XBUTTON2);
+        if(IsMouseButton(DownKeyCode) || IsMouseButton(UpKeyCode)){
+            MouseHook = SetWindowsHookExW(WH_MOUSE_LL,LowLevelMouseProc,nullptr,0);
 
-        if(IsMouseButton){
-            Hook = SetWindowsHookExW(WH_MOUSE_LL,LowLevelMouseProc,nullptr,0);
-        }else{
-            Hook = SetWindowsHookExW(WH_KEYBOARD_LL,LowLevelKeyboardProc,nullptr,0);
+            if(!MouseHook){
+                throw std::system_error(GetLastError(),std::system_category());
+            }
         }
 
-        if(!Hook){
-            throw std::system_error(GetLastError(),std::system_category());
+        if(IsKeyboardKey(DownKeyCode) || IsKeyboardKey(UpKeyCode)){
+            KeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL,LowLevelKeyboardProc,nullptr,0);
+
+            if(!KeyboardHook){
+                throw std::system_error(GetLastError(),std::system_category());
+            }
         }
 
         // Execute every 5 milliseconds, 200 times a second.
@@ -221,6 +296,4 @@ int main(int argc,char** argv){
 
         return 1;
     }
-
-    return 0;
 }
