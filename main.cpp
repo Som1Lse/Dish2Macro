@@ -1,16 +1,15 @@
+#include "ini.h"
+
 #include <atomic>
-#include <memory>
-#include <string>
+#include <charconv>
 #include <string_view>
 #include <system_error>
 
-#include <cstdio>
-#include <cwchar>
+#include <iostream>
+
 #include <cassert>
 
 #include <windows.h>
-
-using namespace std::literals;
 
 namespace {
 
@@ -22,8 +21,105 @@ constexpr unsigned SpamDownBit = 0x1;
 constexpr unsigned SpamUpBit   = 0x2;
 std::atomic<unsigned> SpamFlags(0);
 
+DWORD Interval = 5;
+
 DWORD DownKeyCode = 0;
 DWORD UpKeyCode   = 0;
+
+template <typename T>
+inline auto ParseInt(std::string_view Value,T* r,const char* Message){
+    auto Begin = Value.data();
+    auto End = Begin+Value.size();
+
+    int Base = 10;
+
+    if(Begin[0] == '0' && (Begin[1]|32) == 'x'){
+        Begin += 2;
+        Base = 16;
+    }
+
+    auto [Ptr,Error] = std::from_chars(Begin,End,*r,Base);
+    if(Error != std::errc()){
+        throw std::system_error(std::make_error_code(Error),Message);
+    }
+
+    return Value.begin()+(Ptr-Value.data());
+}
+
+void ReadConfiguration(ini_lexer Ini){
+    auto Token = Ini.Next();
+    if(Token.Type != ini_token_type::Section || Token.Key != "general"){
+        Ini.Error("Expected [general] section.");
+    }
+
+    bool HasInterval = false;
+
+    while(Token.Type != ini_token_type::Eof){
+        Token = Ini.Next();
+
+        switch(Token.Type){
+            case ini_token_type::Eof: {
+                break;
+            }
+            case ini_token_type::Section: {
+                Ini.Error("Unexpected section.");
+            }
+            case ini_token_type::KeyValue: {
+                if(Token.Key == "interval"){
+                    if(HasInterval){
+                        Ini.Error("Event interval specified twice.");
+                    }
+
+                    if(ParseInt(Token.Value,&Interval,Ini.Name().c_str()) != Token.Value.end()){
+                        Ini.Error("Invalid value for the event interval.");
+                    }
+
+                    if(Interval == 0){
+                        Ini.Error("Invalid value for the event interval.");
+                    }
+
+                    HasInterval = true;
+                }else if(Token.Key == "upbind"){
+                    if(UpKeyCode != 0){
+                        Ini.Error("Scroll up key bind specified twice.");
+                    }
+
+                    if(ParseInt(Token.Value,&UpKeyCode,Ini.Name().c_str()) != Token.Value.end()){
+                        Ini.Error("Invalid value for scroll up key bind.");
+                    }
+
+                    if(UpKeyCode == 0 || UpKeyCode > 0xFE){
+                        Ini.Error("Invalid value for scroll up key bind.");
+                    }
+                }else if(Token.Key == "downbind"){
+                    if(DownKeyCode != 0){
+                        Ini.Error("Scroll down key bind specified twice.");
+                    }
+
+                    if(ParseInt(Token.Value,&DownKeyCode,Ini.Name().c_str()) != Token.Value.end()){
+                        Ini.Error("Invalid value for scroll down key bind.");
+                    }
+
+                    if(DownKeyCode == 0 || DownKeyCode > 0xFE){
+                        Ini.Error("Invalid value for scroll down key bind.");
+                    }
+                }else{
+                    Ini.Error("Invalid key/value pair.");
+                }
+
+                break;
+            }
+        }
+    }
+
+    if(DownKeyCode == UpKeyCode){
+        if(DownKeyCode == 0){
+            Ini.Error("No key was bound to either scroll direction.");
+        }else{
+            Ini.Error("Scroll up and scroll down both have the same binding.");
+        }
+    }
+}
 
 bool IsGameInFocus(){
     auto Window = GetForegroundWindow();
@@ -31,7 +127,11 @@ bool IsGameInFocus(){
     constexpr int BufferSize = 35;
     wchar_t Buffer[BufferSize];
 
-    std::wstring_view Str = {Buffer,static_cast<std::size_t>(GetClassNameW(Window,Buffer,BufferSize))};
+    std::wstring_view Str = {
+        Buffer,
+        static_cast<std::size_t>(GetClassNameW(Window,Buffer,BufferSize))
+    };
+
     if(Str == L"LaunchUnrealUWindowsClient"){
         Str = {Buffer,static_cast<std::size_t>(GetWindowTextW(Window,Buffer,BufferSize))};
 
@@ -58,10 +158,12 @@ bool IsGameInFocus(){
 bool HandleKey(DWORD KeyCode,bool IsDown){
     unsigned Mask = 0;
 
-    if(KeyCode == DownKeyCode){
-        Mask = SpamDownBit;
-    }else if(KeyCode == UpKeyCode){
-        Mask = SpamUpBit;
+    if(KeyCode != 0){
+        if(KeyCode == DownKeyCode){
+            Mask = SpamDownBit;
+        }else if(KeyCode == UpKeyCode){
+            Mask = SpamUpBit;
+        }
     }
 
     if(Mask == 0 || !IsGameInFocus()){
@@ -166,81 +268,27 @@ DWORD GetWheelDelta(unsigned Flags){
     return r;
 }
 
-void CALLBACK TimerProc(void*,BOOLEAN){
+void CALLBACK TimerProc(UINT,UINT,DWORD_PTR,DWORD_PTR,DWORD_PTR){
     if(IsGameInFocus()){
         auto WheelDelta = GetWheelDelta(SpamFlags);
 
         if(WheelDelta != 0){
-            mouse_event(MOUSEEVENTF_WHEEL,0,0,WheelDelta,0);
+            INPUT Input = {};
+            Input.type = INPUT_MOUSE;
+            Input.mi.mouseData = WheelDelta;
+            Input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+
+            SendInput(1,&Input,sizeof(Input));
         }
     }else{
         SpamFlags = 0;
     }
 }
 
-struct file_deleter {
-    void operator()(std::FILE* File) const noexcept {
-        std::fclose(File);
-    }
-};
-
-using unique_file = std::unique_ptr<std::FILE,file_deleter>;
-
-// There are a few valid possible configurations:
-// <num>: <num> is the scroll down key.
-// <num> <c>: <num> is the key for either scroll up or down depending on whether or not <c> is `u` or not.
-// <num1> <num2>: <num1> is the scroll down key. <num2> is the scroll up key.
-void ReadConfiguration(const char* Filename){
-    unique_file File(std::fopen(Filename,"rb"));
-    if(!File){
-        throw std::runtime_error("Unable to open configuration file \""s+Filename+"\".");
-    }
-
-    auto KeyCodesRead = std::fscanf(File.get(),"%li %li",&DownKeyCode,&UpKeyCode);
-
-    if(KeyCodesRead < 1){
-        throw std::runtime_error("Unable to read key code from configuration file \""s+Filename+"\".");
-    }
-
-    if(KeyCodesRead < 2){
-        char WheelDirection = 'd';
-
-        if(std::fscanf(File.get()," %c",&WheelDirection) == 1){
-            // `|32` converts ASCII letters to lower case.
-            switch(WheelDirection|32){
-                case 'd': break;
-                case 'u': {
-                    UpKeyCode = DownKeyCode;
-                    DownKeyCode = 0;
-
-                    break;
-                }
-                default: {
-                    throw std::runtime_error("Invalid wheel direction '+"s+WheelDirection+"+' in configuration file \""+Filename+"\".");
-                }
-            }
-        }
-    }
-
-    if(DownKeyCode > VK_OEM_CLEAR){
-        throw std::runtime_error("Invalid key code "+std::to_string(DownKeyCode)+" in configuration file \""s+Filename+"\".");
-    }
-
-    if(UpKeyCode > VK_OEM_CLEAR){
-        throw std::runtime_error("Invalid key code "+std::to_string(UpKeyCode)+" in configuration file \""s+Filename+"\".");
-    }
-
-    if(DownKeyCode == UpKeyCode){
-        if(DownKeyCode == 0){
-            throw std::runtime_error("No key was bound to either scroll direction in configuration file \""s+Filename+"\".");
-        }else{
-            throw std::runtime_error("Scroll up and scroll down both have the same binding in configuration file \""s+Filename+"\".");
-        }
-    }
-}
-
 bool IsMouseButton(DWORD KeyCode){
-    return (VK_LBUTTON <= KeyCode && KeyCode <= VK_RBUTTON) || (VK_MBUTTON <= KeyCode && KeyCode <= VK_XBUTTON2);
+    return
+        (VK_LBUTTON <= KeyCode && KeyCode <= VK_RBUTTON) ||
+        (VK_MBUTTON <= KeyCode && KeyCode <= VK_XBUTTON2);
 }
 
 bool IsKeyboardKey(DWORD KeyCode){
@@ -251,13 +299,13 @@ bool IsKeyboardKey(DWORD KeyCode){
 
 int main(int argc,char** argv){
     try {
-        auto ConfigFilename = "Dish2Macro.txt";
+        auto ConfigFilename = "Dish2Macro.ini";
 
         if(argc >= 2){
             ConfigFilename = argv[1];
         }
 
-        ReadConfiguration(ConfigFilename);
+        ReadConfiguration(ini_lexer(ConfigFilename));
 
         if(IsMouseButton(DownKeyCode) || IsMouseButton(UpKeyCode)){
             MouseHook = SetWindowsHookExW(WH_MOUSE_LL,LowLevelMouseProc,nullptr,0);
@@ -275,24 +323,29 @@ int main(int argc,char** argv){
             }
         }
 
-        // Execute every 5 milliseconds, 200 times a second.
-        DWORD Period = 5;
-
-        HANDLE Timer;
-        if(!CreateTimerQueueTimer(&Timer,nullptr,TimerProc,nullptr,0,Period,WT_EXECUTEDEFAULT)){
+        if(!timeSetEvent(Interval,1,TimerProc,0,TIME_PERIODIC|TIME_CALLBACK_FUNCTION)){
             throw std::system_error(GetLastError(),std::system_category());
         }
 
         for(;;){
             MSG Message;
-            while(GetMessageW(&Message,0,0,0)){
+            while(GetMessageW(&Message,nullptr,0,0)){
                 TranslateMessage(&Message);
                 DispatchMessageW(&Message);
             }
         }
     }catch(std::exception& e){
-        std::fprintf(stderr,"Error: %s\n",e.what());
-        std::getchar();
+        if(MouseHook){
+            UnhookWindowsHookEx(MouseHook);
+        }
+
+        if(KeyboardHook){
+            UnhookWindowsHookEx(KeyboardHook);
+        }
+
+        std::cerr << "Error: " << e.what() << "\n\nPress Enter to exit...\n";
+
+        std::cin.get();
 
         return 1;
     }
