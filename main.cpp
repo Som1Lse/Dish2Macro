@@ -5,8 +5,6 @@
 #include <string_view>
 #include <system_error>
 
-#include <iostream>
-
 #include <cassert>
 
 #include <windows.h>
@@ -297,6 +295,24 @@ bool IsKeyboardKey(DWORD KeyCode){
 
 }
 
+std::wstring GetKeyName(DWORD KeyCode){
+    auto ScanCode = MapVirtualKeyW(KeyCode,MAPVK_VK_TO_VSC);
+    constexpr int BufferLength = 256;
+    wchar_t Buffer[BufferLength];
+
+    auto Length = GetKeyNameTextW(static_cast<LONG>(ScanCode << 16),Buffer,BufferLength);
+
+    switch(KeyCode){
+        case VK_LBUTTON:  return L"Mouse1";
+        case VK_RBUTTON:  return L"Mouse2";
+        case VK_MBUTTON:  return L"Mouse3";
+        case VK_XBUTTON1: return L"Mouse4";
+        case VK_XBUTTON2: return L"Mouse5";
+    }
+
+    return {Buffer,Buffer+Length};
+}
+
 int main(int argc,char** argv){
     try {
         auto ConfigFilename = "Dish2Macro.ini";
@@ -327,6 +343,23 @@ int main(int argc,char** argv){
             throw std::system_error(GetLastError(),std::system_category());
         }
 
+        std::printf("The macro is running.\n");
+
+        if(DownKeyCode != 0){
+            std::printf("Scroll down bound to %ls (0x%X).\n",
+                GetKeyName(DownKeyCode).c_str(),DownKeyCode);
+        }
+
+        if(UpKeyCode != 0){
+            std::printf("Scroll up bound to %ls (0x%X).\n",
+                GetKeyName(UpKeyCode).c_str(),UpKeyCode);
+        }
+
+        std::printf("Macro will fire every %u milliseconds, %u times a second.\n\n",
+            Interval,1000/Interval);
+
+        std::printf("Close this window to stop the macro.\n");
+
         for(;;){
             MSG Message;
             while(GetMessageW(&Message,nullptr,0,0)){
@@ -343,9 +376,9 @@ int main(int argc,char** argv){
             UnhookWindowsHookEx(KeyboardHook);
         }
 
-        std::cerr << "Error: " << e.what() << "\n\nPress Enter to exit...\n";
+        std::fprintf(stderr,"Error: %s\n\nPress Enter to exit...\n",e.what());
 
-        std::cin.get();
+        (void)std::getchar();
 
         return 1;
     }
